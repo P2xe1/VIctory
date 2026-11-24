@@ -715,6 +715,145 @@ fn v_cvt_u16_and_i16_f16_saturate() {
 }
 
 #[test]
+fn v_cvt_f16_u16_and_i16_convert_the_low_half() {
+    // The other direction of `v_cvt_u16_and_i16_f16_saturate`: VOP1 0x050 and
+    // 0x051 read the low 16 bits of the source as a u16 (zero-extended) or an
+    // i16 (sign-extended) and convert it to f16. Every u16 and i16 is exact in
+    // f32, so nothing is lost before the f32 -> f16 step. Two things these cases
+    // pin down:
+    //
+    // * the extension: the i16 form shifts left then arithmetically right by 16
+    //   (a path shared with no other tested instruction) and the u16 form does
+    //   not, so the same 0xFFFF is 65535 one way and -1 the other;
+    // * the rounding, which is truncation, not nearest even: the f32 -> f16 step
+    //   (`legacyF32ToF16`) rounds toward zero on both host backends, so 2051
+    //   gives 2050, 32767 gives 32752 and 65520 gives 65504 instead of +inf.
+    //   Measured here on an AMD RX 7600M XT (RDNA3) and on WARP, which agree on
+    //   every row; the NVIDIA figures quoted in #866 and in #422's note
+    //   ("0x6801 on main") agree. #422 moves the ties to nearest even, so its
+    //   merge has to update these rows.
+    let cases: &[(u16, u16, u16)] = &[
+        // (source bits, f16 from v_cvt_f16_u16, f16 from v_cvt_f16_i16)
+        (0x0000, 0x0000, 0x0000), // 0 -> 0.0
+        (0x0001, 0x3C00, 0x3C00), // 1 -> 1.0
+        (0x0002, 0x4000, 0x4000), // 2 -> 2.0
+        (0x000F, 0x4B80, 0x4B80), // 15 -> 15.0
+        (0x0010, 0x4C00, 0x4C00), // 16 -> 16.0
+        (0x0080, 0x5800, 0x5800), // 128 -> 128.0
+        (0x0100, 0x5C00, 0x5C00), // 256 -> 256.0
+        (0x0400, 0x6400, 0x6400), // 1024 -> 1024.0
+        // Above 2048 the spacing of f16 doubles to 2, so the integers in
+        // between have to round: all three of these go toward zero.
+        (0x0800, 0x6800, 0x6800), // 2048, the last exact one
+        (0x0801, 0x6800, 0x6800), // 2049 -> 2048
+        (0x0802, 0x6801, 0x6801), // 2050, exact
+        (0x0803, 0x6801, 0x6801), // 2051 -> 2050
+        (0x0804, 0x6802, 0x6802), // 2052, exact
+        (0x0C00, 0x6A00, 0x6A00), // 3072 -> 3072.0
+        (0x1000, 0x6C00, 0x6C00), // 4096 -> 4096.0
+        (0x2000, 0x7000, 0x7000), // 8192 -> 8192.0
+        (0x4000, 0x7400, 0x7400), // 16384 -> 16384.0
+        (0x6000, 0x7600, 0x7600), // 24576 -> 24576.0
+        (0x7FFF, 0x77FF, 0x77FF), // 32767 -> 32752
+        // Where the two forms part ways.
+        (0x8000, 0x7800, 0xF800), // u16 32768 / i16 -32768, both exact
+        (0x8001, 0x7800, 0xF7FF), // u16 32769 -> 32768 / i16 -32767 -> -32752
+        (0xC000, 0x7A00, 0xF400), // u16 49152 / i16 -16384
+        (0xFFEF, 0x7BFF, 0xCC40), // u16 65519 -> 65504 / i16 -17
+        (0xFFF0, 0x7BFF, 0xCC00), // u16 65520 -> 65504, not +inf / i16 -16
+        (0xFFF1, 0x7BFF, 0xCB80), // u16 65521 -> 65504 / i16 -15
+        (0xFFFE, 0x7BFF, 0xC000), // u16 65534 -> 65504 / i16 -2
+        (0xFFFF, 0x7BFF, 0xBC00), // u16 65535 -> 65504 / i16 -1
+    ];
+    // The bits the table is written in, read back as the values they mean.
+    assert_eq!(f16_to_f32(0x3C00), 1.0);
+    assert_eq!(f16_to_f32(0x7BFF), 65504.0);
+    // The two forms differ exactly where the source's top bit is set, and agree
+    // everywhere below it: neither form loses the low 16 bits before converting.
+    for &(bits, from_u16, from_i16) in cases {
+        assert_eq!(
+            bits & 0x8000 != 0,
+            from_u16 != from_i16,
+            "{bits:#06x}: the forms agree exactly where the sign bit is clear",
+        );
+    }
+
+    for (op, what, pick) in [
+        (0x050u16, "v_cvt_f16_u16", 0usize),
+        (0x051, "v_cvt_f16_i16", 1),
+    ] {
+        // `v_mov_b32 v0, v2` (the seed: root constant s1) then the conversion of
+        // v1 (root constant s0). The 16-bit result lands in the low half of v0
+        // and the seed's high half is kept, so the stored dword checks the
+        // result on its own.
+        let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(2)), vop1(op, 0, vgpr(1))]);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [u32::from(c.0), 0, 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let want = u32::from(if pick == 0 { cases[i].1 } else { cases[i].2 });
+            assert_eq!(
+                got, want,
+                "{backend}: {what}({:#06x}) = {got:#010x}, want {want:#010x}",
+                cases[i].0,
+            );
+        });
+
+        // The same conversions into a destination whose high half is set: GFX10
+        // keeps the half a 16-bit result does not write.
+        let seed = 0xDEAD_0000u32;
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [u32::from(c.0), seed, 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let low = u32::from(if pick == 0 { cases[i].1 } else { cases[i].2 });
+            let want = seed | low;
+            assert_eq!(
+                got, want,
+                "{backend}: {what}({:#06x}) into {seed:#010x} = {got:#010x}, want {want:#010x}",
+                cases[i].0,
+            );
+        });
+    }
+}
+
+#[test]
+fn v_cvt_f16_f32_truncates_rather_than_rounding() {
+    // The step every f16 result goes through: `legacyF32ToF16`, which rounds
+    // toward zero instead of to nearest even (measured on an AMD RX 7600M XT
+    // and on WARP, which agree). The ties below are exactly halfway between two
+    // halves, so they are the cases a change of rounding mode would move.
+    let cases: &[(u32, u16, &str)] = &[
+        // (f32 source, f16 result, what it is)
+        (
+            0x3F80_1000,
+            0x3C00,
+            "1 + 2^-11: tie between 1.0 and 1 + 2^-10",
+        ),
+        (
+            0x3F80_3000,
+            0x3C01,
+            "1 + 3*2^-11: tie, to nearest even would carry",
+        ),
+        (0x477F_E000, 0x7BFF, "65519.0: below the largest half"),
+        (
+            0x477F_F000,
+            0x7BFF,
+            "65520.0: the overflow tie, +inf to nearest even",
+        ),
+        // Truncating also means saturating: no conversion gives an f16 infinity.
+        (0x4780_0000, 0x7BFF, "65536.0: past the largest half"),
+        (0x7149_F2CA, 0x7BFF, "1e30: far past it"),
+    ];
+    let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(2)), vop1(0x00A, 0, vgpr(1))]);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(bits, _, _)| [bits, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let (bits, want, what) = cases[i];
+        assert_eq!(
+            got,
+            u32::from(want),
+            "{backend}: v_cvt_f16_f32({bits:#010x}) = {got:#010x}, want {want:#06x} ({what})",
+        );
+    });
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
